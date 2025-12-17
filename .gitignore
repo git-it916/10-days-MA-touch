@@ -2,7 +2,9 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+database/
+.vscode/
+venv32/
 # C extensions
 *.so
 

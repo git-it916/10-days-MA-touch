@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+#.\venv32\Scripts\Activate.ps1
+
 """
 KOSPI 모멘텀 전략 (09:00~09:20) - 키움 REST API (ka10080/kt10000/ka01690)
 
@@ -23,11 +25,13 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import re
 import logging
+import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import requests
 
 
@@ -45,6 +49,68 @@ def _to_float(val: Any) -> float:
         return abs(float(s))
     except Exception:
         return 0.0
+
+
+def _hhmm_to_minutes(tm: str) -> Optional[int]:
+    try:
+        if len(tm) < 4:
+            return None
+        return int(tm[:2]) * 60 + int(tm[2:4])
+    except Exception:
+        return None
+
+
+def _save_minute_returns(
+    date_str: str,
+    code: str,
+    minute_prices: Dict[str, float],
+    start_tm: str = "0900",
+    end_tm: str = "0930",
+) -> None:
+    """
+    분봉별 가격/수익률을 CSV로 적재 (날짜별 디렉터리).
+    """
+    base_price = minute_prices.get(start_tm)
+    if not base_price:
+        logging.warning("분봉 로그 생략: %s 시가 없음", start_tm)
+        return
+
+    start_min = _hhmm_to_minutes(start_tm) or 0
+    rows: List[Dict[str, Any]] = []
+    for tm in sorted(minute_prices):
+        if tm < start_tm or tm > end_tm:
+            continue
+        price = minute_prices[tm]
+        offset = _hhmm_to_minutes(tm)
+        ret = (price - base_price) / base_price if base_price else 0.0
+        rows.append(
+            {
+                "date": date_str,
+                "time": tm,
+                "minute_offset": (offset - start_min) if offset is not None else None,
+                "code": code,
+                "price": price,
+                "ret_from_start": ret,
+            }
+        )
+
+    if not rows:
+        logging.warning("분봉 로그 생략: %s~%s 구간 데이터 없음", start_tm, end_tm)
+        return
+
+    db_dir = Path("database") / "daily_cumulating" / date_str
+    db_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = db_dir / f"{date_str}_min_ret.csv"
+    df_new = pd.DataFrame(rows)
+
+    if csv_path.exists():
+        df_old = pd.read_csv(csv_path)
+        df = pd.concat([df_old, df_new], ignore_index=True)
+        df = df.drop_duplicates(subset=["date", "time", "code"], keep="last")
+    else:
+        df = df_new
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    logging.info("분봉 로그 저장(CSV): %s (추가 %d행)", csv_path, len(df_new))
 
 
 class KiwoomREST:
@@ -241,14 +307,18 @@ def run_strategy(client: KiwoomREST) -> None:
     price_09 = None
     price_0920 = None
     times_seen = []
+    minute_price: Dict[str, float] = {}
     for it in items:
         tm = _parse_time(it)
+        price_val = _parse_price(it)
         if tm:
             times_seen.append(tm)
+        if tm and price_val > 0:
+            minute_price[tm] = price_val
         if tm == "0900":
-            price_09 = _parse_price(it)
+            price_09 = price_val
         if tm == "0920":
-            price_0920 = _parse_price(it)
+            price_0920 = price_val
     if price_09 is None or price_0920 is None:
         logging.error(
             "09:00/09:20 데이터 부족 | 09:00=%.1f 09:20=%.1f | 시간예시=%s",
@@ -260,6 +330,7 @@ def run_strategy(client: KiwoomREST) -> None:
 
     ret = (price_0920 - price_09) / price_09 if price_09 else 0
     logging.info("09:00=%.2f 09:20=%.2f 수익률=%.4f", price_09, price_0920, ret)
+    _save_minute_returns(today, "069500", minute_price, start_tm="0900", end_tm="0930")
 
     target_code = "069500" if ret > 0 else "114800"
     target_name = "KODEX 200" if ret > 0 else "KODEX 인버스"
