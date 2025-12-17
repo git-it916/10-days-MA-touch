@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import re
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -40,7 +41,8 @@ def _pick_first(mapping: Dict[str, Any], keys: List[str], default: Any = None) -
 def _to_float(val: Any) -> float:
     try:
         s = str(val).replace(",", "").replace("+", "")
-        return float(s)
+        # 가격이 음수 문자열로 올 때도 절댓값 처리
+        return abs(float(s))
     except Exception:
         return 0.0
 
@@ -125,11 +127,33 @@ class KiwoomREST:
             or []
         )
         if not items:
-            logging.error(
-                "[ka10080] 분봉 응답에 데이터가 없습니다. keys=%s body_sample=%s",
+            msg = data.get("return_msg") or ""
+            logging.warning(
+                "[ka10080] 분봉 데이터 없음(code=%s). keys=%s msg=%s body_sample=%s",
+                code,
                 list(data.keys()),
+                msg,
                 json.dumps(data, ensure_ascii=False)[:400],
             )
+            # 한 번 더 대기 후 재시도
+            time.sleep(1)
+            resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
+            if resp.status_code == 429:
+                logging.warning("ka10080 429 재발생, 추가 2초 대기 후 중단")
+                time.sleep(2)
+            elif resp.status_code >= 400:
+                raise RuntimeError(f"Intraday request failed (retry): {resp.status_code} {resp.text}")
+            data = resp.json()
+            items = (
+                data.get("stk_min_pole_chart_qry")
+                or data.get("stk_min_pole_chart_qty")
+                or data.get("rec")
+                or []
+            )
+            if not items:
+                raise RuntimeError(
+                    f"Intraday data empty for {code}. msg={data.get('return_msg','')} sample={json.dumps(data, ensure_ascii=False)[:400]}"
+                )
         return items
 
     # ------------------------------------------------------------- Balance (ka01690)
@@ -170,10 +194,12 @@ class KiwoomREST:
         url = f"{self.base_url}/api/dostk/ordr"
         headers = self._auth_headers("kt10000")
         body = {
-            "ord_qty": str(qty),
-            "ord_uv": "0",     # 시장가
-            "trde_tp": "03",   # 시장가 코드
-            "stk_cd": code,
+            "trde_tp": "03",        # 거래구분: 03 (시장가)
+            "ord_qty": str(qty),    # 주문수량
+            "ord_uv": "0",          # 주문단가 (시장가는 0)
+            "stk_cd": code,         # 종목코드
+            "dmst_stex_tp": "KRX",  # 거래소 구분
+            "ord_dv": "00",         # 주문 구분 (00: 현금매수)
         }
         resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
         if resp.status_code >= 400:
@@ -184,35 +210,23 @@ class KiwoomREST:
 # =================================================================== Strategy
 def run_strategy(client: KiwoomREST) -> None:
     today = dt.datetime.now().strftime("%Y%m%d")
+    logging.info(f"전략 시작: {today} (대상: KODEX 200 vs 인버스)")
 
-    # 1. 1분봉 데이터 가져오기 (KODEX 200)
+    # 1. 1분봉 데이터 가져오기 (KODEX 200) - 안전 대기
+    time.sleep(0.5)
     items = client.fetch_intraday_1m("069500", start_date=today, end_date=today)
 
     def _parse_time(item: Dict[str, Any]) -> str:
-        """
-        응답 내 시간 필드를 HHMM으로 정규화.
-        가능한 키: cntr_tm(YYYYMMDDHHMMSS), trd_tm, trd_time, time, hhmm, hhmmss 등.
-        숫자만 추출 후 앞 12자리에서 HHMM을 추출 (예: 20250307132000 -> 1320, 090000 -> 0900).
-        """
         raw = str(
             _pick_first(
                 item,
-                [
-                    "cntr_tm",
-                    "trd_tm",
-                    "trd_time",
-                    "time",
-                    "hhmm",
-                    "hhmmss",
-                    "stk_tm",
-                    "stck_bsop_time",
-                ],
+                ["cntr_tm", "trd_tm", "trd_time", "time", "hhmm", "hhmmss", "stk_tm", "stck_bsop_time"],
                 default="",
             )
         )
         digits = re.sub(r"\D", "", raw)
         if len(digits) >= 12:
-            return digits[8:12]  # YYYYMMDDHHMMSS -> HHMM
+            return digits[8:12]
         if len(digits) >= 4:
             return digits[:4]
         return digits.zfill(4)
@@ -220,7 +234,10 @@ def run_strategy(client: KiwoomREST) -> None:
     def _parse_price(item: Dict[str, Any]) -> float:
         return _to_float(_pick_first(item, ["cur_prc", "clpr", "close_pric", "stck_prpr", "prpr"], 0))
 
-    # 필터 09:00, 09:20 데이터 찾기
+    if not items:
+        logging.error("KODEX 200(069500) 차트 데이터를 가져오지 못했습니다. 장 시작 전/휴장일 가능성.")
+        return
+
     price_09 = None
     price_0920 = None
     times_seen = []
@@ -234,47 +251,64 @@ def run_strategy(client: KiwoomREST) -> None:
             price_0920 = _parse_price(it)
     if price_09 is None or price_0920 is None:
         logging.error(
-            "09:00 또는 09:20 데이터가 없습니다. (장 시작 전/데이터 미수신/시간 필드 불일치) | 예시 시간들=%s",
-            sorted(set(times_seen))[:10],
+            "09:00/09:20 데이터 부족 | 09:00=%.1f 09:20=%.1f | 시간예시=%s",
+            price_09 or 0,
+            price_0920 or 0,
+            sorted(list(set(times_seen)))[:10],
         )
         return
 
     ret = (price_0920 - price_09) / price_09 if price_09 else 0
     logging.info("09:00=%.2f 09:20=%.2f 수익률=%.4f", price_09, price_0920, ret)
 
-    # 2. 방향 결정
     target_code = "069500" if ret > 0 else "114800"
-    logging.info("매수 대상: %s (ret %s)", target_code, "LONG" if ret > 0 else "SHORT via inverse")
+    target_name = "KODEX 200" if ret > 0 else "KODEX 인버스"
+    logging.info("매수 대상: %s (%s)", target_code, "LONG" if ret > 0 else "SHORT via inverse")
 
-    # 3. 잔고 조회 -> 현금 파악
+    # 3. 잔고 조회 (안전 대기)
+    time.sleep(1.0)
     bal = client.fetch_balance()
     cash = client.extract_cash(bal)
     if cash <= 0:
-        logging.error("사용 가능 현금이 없습니다. cash=%.2f", cash)
+        logging.error("주문 가능 현금이 없습니다. cash=%.2f", cash)
         return
+    logging.info("현재 보유 현금: %.0f원", cash)
 
-    # 4. 매수 단가: 대상 코드의 최신 가격을 다시 가져와 계산 (가장 최근 1분 봉)
+    # 4. 대상 코드 가격 조회 (대기 시간 1.5초로 증가)
+    time.sleep(1.5)
     items_target = client.fetch_intraday_1m(target_code, start_date=today, end_date=today)
     last_price = None
     if items_target:
-        last_price = _parse_price(items_target[0])
         for it in items_target:
             lp = _parse_price(it)
-            if lp:
+            if lp > 0:
                 last_price = lp
                 break
     if not last_price or last_price <= 0:
-        logging.error("대상 코드의 가격을 가져오지 못했습니다.")
+        logging.error(f"대상 코드({target_code})의 현재가를 가져오지 못했습니다.")
+        if not items_target:
+            logging.error(" -> 응답 리스트가 비었습니다. (Rate Limit 또는 데이터 없음)")
+        else:
+            logging.error(f" -> 데이터는 있으나 가격 파싱 실패. 첫 샘플: {items_target[0]}")
         return
 
-    qty = int(cash // last_price)
+    invest_cash = cash * 0.03
+    qty = int(invest_cash // last_price)
     if qty <= 0:
-        logging.error("매수 수량이 0입니다. cash=%.2f, price=%.2f", cash, last_price)
+        logging.error(
+            "매수 가능 수량이 0입니다. (투입금: %.0f=현금의 3%%, 현재가: %.0f)",
+            invest_cash,
+            last_price,
+        )
         return
 
-    # 5. 시장가 매수
+    logging.info(
+        f"주문 실행: {target_name}({target_code}) {qty}주 매수 "
+        f"(현금의 3% 투입={invest_cash:.0f}, 예상단가={last_price})"
+    )
+    time.sleep(0.5)
     resp = client.send_market_buy(target_code, qty)
-    logging.info("주문 완료: %s", json.dumps(resp, ensure_ascii=False))
+    logging.info("주문 결과: %s", json.dumps(resp, ensure_ascii=False))
 
 
 def main() -> None:
