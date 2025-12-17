@@ -1,3 +1,5 @@
 PyQt5>=5.15.9
 pywin32>=306
-pandas>=2.0.0
+# 32비트 환경 호환성을 위해 pandas는 2.0 계열, numpy는 1.x로 고정
+pandas==2.0.3
+numpy>=1.26,<2
