@@ -127,7 +127,7 @@ class KiwoomRestClient:
         if to_date is None:
             to_date = dt.datetime.now().strftime("%Y%m%d")
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",  # 코스피/코스닥(한국 주식)
+            "FID_COND_MRKT_DIV_CODE": "J",  # 코스피/코스닥
             "FID_INPUT_ISCD": code,         # 종목코드
             "FID_INPUT_DATE_1": to_date,    # 기준일자
             "FID_PERIOD_DIV_CODE": "D",     # 일봉
