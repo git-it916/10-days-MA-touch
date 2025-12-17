@@ -37,12 +37,12 @@ class KiwoomREST:
         self.client.authenticate()
 
     def get_daily_ohlcv(self, code: str, to_date: Optional[str] = None, count: int = 20) -> List[Candle]:
-        """일봉 조회"""
-        return self.client.fetch_daily_candles(code, to_date=to_date, count=count)
+        """일봉 조회 (ka10005)"""
+        return self.client.fetch_daily_candles(code, to_date=to_date, count=count, period="D")
 
-    def get_balance(self) -> Dict[str, Any]:
-        """잔고 조회"""
-        return self.client.fetch_balance()
+    def get_balance(self, qry_dt: Optional[str] = None) -> Dict[str, Any]:
+        """잔고 조회 (ka01690 일별잔고수익률)"""
+        return self.client.fetch_balance(qry_dt=qry_dt)
 
     def buy_market(self, code: str, qty: int) -> Dict[str, Any]:
         """시장가 매수"""
@@ -72,6 +72,9 @@ if __name__ == "__main__":
     if candles:
         print(candles[0])
 
-    # 예시: 잔고 조회
-    balance = kiwoom.get_balance()
-    print("잔고 응답 키:", list(balance.keys()))
+    # 예시: 잔고 조회 (엔드포인트/TR-ID가 맞지 않으면 실패할 수 있으니 예외 무시)
+    try:
+        balance = kiwoom.get_balance()
+        print("잔고 응답 키:", list(balance.keys()))
+    except Exception as exc:  # pragma: no cover - 데모용
+        print(f"[잔고 조회 실패] 엔드포인트/TR-ID를 문서에 맞게 설정하세요: {exc}")

@@ -55,11 +55,13 @@ class KiwoomRestClient:
         app_secret: str,
         account_no: str,
         token_path: str = "/oauth2/token",
-        candle_path: str = "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
-        balance_path: str = "/uapi/domestic-stock/v1/trading/inquire-balance",
+        # 키움 REST 기본값(일봉: ka10005)
+        candle_path: str = "/api/dostk/mrkcond",
+        # 잔고(일별잔고수익률 등) 기본값을 키움 REST 규격으로 변경
+        balance_path: str = "/api/dostk/acnt",
         order_path: str = "/uapi/domestic-stock/v1/trading/order-cash",
-        tr_id_quote: str = "FHKST01010400",
-        tr_id_balance: str = "TTTC8434R",
+        tr_id_quote: str = "ka10005",
+        tr_id_balance: str = "ka01690",
         tr_id_buy: str = "TTTC0802U",
         tr_id_sell: str = "TTTC0801U",
         timeout: float = 10.0,
@@ -108,12 +110,14 @@ class KiwoomRestClient:
         if not self._token:
             self.authenticate()
         headers = {
-            "authorization": f"Bearer {self._token}",
-            "appkey": self.app_key,
-            "appsecret": self.app_secret,
+            "Authorization": f"Bearer {self._token}",
+            "AppKey": self.app_key,
+            "AppSecret": self.app_secret,
+            "Content-Type": "application/json; charset=UTF-8",
         }
         if tr_id:
-            headers["tr_id"] = tr_id
+            # 키움 REST는 api-id 사용
+            headers["api-id"] = tr_id
         return headers
 
     def _url(self, path: str) -> str:
@@ -121,59 +125,52 @@ class KiwoomRestClient:
             return path
         return f"{self.base_url}{path}"
 
-    # 시세/일봉 조회 (REST 기준 샘플)
-    def fetch_daily_candles(self, code: str, to_date: Optional[str] = None, count: int = 20) -> List[Candle]:
+    # 시세/일봉 조회 (키움 REST ka10005)
+    def fetch_daily_candles(self, code: str, to_date: Optional[str] = None, count: int = 100, period: str = "D") -> List[Candle]:
+        """
+        ka10005: /api/dostk/mrkcond
+        필수 바디: stk_cd (종목코드), qry_tp (D/W/M/m)
+        """
         url = self._url(self.candle_path)
-        if to_date is None:
-            to_date = dt.datetime.now().strftime("%Y%m%d")
-        params = {
-            "FID_COND_MRKT_DIV_CODE": "J",  # 코스피/코스닥
-            "FID_INPUT_ISCD": code,         # 종목코드
-            "FID_INPUT_DATE_1": to_date,    # 기준일자
-            "FID_PERIOD_DIV_CODE": "D",     # 일봉
-            "FID_ORG_ADJ_PRC": "1",         # 수정주가
-        }
         headers = self._auth_headers(self.tr_id_quote)
-        resp = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
+        body: Dict[str, Any] = {
+            "stk_cd": code,
+            "qry_tp": period,  # D: 일, W: 주, M: 월, m: 분
+        }
+        # 필요 시 기간 조건 추가
+        if to_date:
+            body["inqr_end_dt"] = to_date  # 문서에 따라 사용할 수 있음
+
+        resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"Candle request failed: {resp.status_code} {resp.text}")
         data = _safe_json(resp)
-        items = data.get("output") or data.get("output1") or []
+        items = data.get("stk_ddwkmm") or data.get("output") or []
         candles: List[Candle] = []
         for item in items[:count]:
             try:
                 candles.append(
                     Candle(
-                        date=str(item.get("stck_bsop_date") or item.get("basDt")),
-                        open=float(item.get("stck_oprc") or item.get("opnprc") or 0),
-                        high=float(item.get("stck_hgpr") or item.get("hgpr") or 0),
-                        low=float(item.get("stck_lwpr") or item.get("lwpr") or 0),
-                        close=float(item.get("stck_clpr") or item.get("clpr") or 0),
-                        volume=float(item.get("acml_vol") or item.get("trqu") or 0),
+                        date=str(item.get("stk_dt") or item.get("date") or ""),
+                        open=float(item.get("oprc") or item.get("open_pric") or 0),
+                        high=float(item.get("hgpr") or item.get("high_pric") or 0),
+                        low=float(item.get("lwpr") or item.get("low_pric") or 0),
+                        close=float(item.get("clpr") or item.get("close_pric") or 0),
+                        volume=float(item.get("acml_vol") or item.get("trde_qty") or 0),
                     )
                 )
             except Exception:
                 continue
         return candles
 
-    # 잔고 조회
-    def fetch_balance(self) -> Dict[str, Any]:
+    # 잔고 조회 (키움 REST 예: ka01690 일별잔고수익률)
+    def fetch_balance(self, qry_dt: Optional[str] = None) -> Dict[str, Any]:
         url = self._url(self.balance_path)
-        params = {
-            "CANO": self.account_no[:-2],
-            "ACNT_PRDT_CD": self.account_no[-2:],
-            "AFHR_FLPR_YN": "N",
-            "OFL_YN": "",
-            "INQR_DVSN": "02",
-            "UNPR_DVSN": "01",
-            "FUND_STTL_ICLD_YN": "N",
-            "FNCG_AMT_AUTO_RDPT_YN": "N",
-            "PRCS_DVSN": "00",
-            "CTX_AREA_FK100": "",
-            "CTX_AREA_NK100": "",
-        }
         headers = self._auth_headers(self.tr_id_balance)
-        resp = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
+        body: Dict[str, Any] = {}
+        if qry_dt:
+            body["qry_dt"] = qry_dt
+        resp = self.session.post(url, json=body, headers=headers, timeout=self.timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"Balance request failed: {resp.status_code} {resp.text}")
         return _safe_json(resp)
@@ -209,10 +206,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-url", default=_load_env("KIWOOM_BASE_URL", "https://api.kiwoom.com"))
     p.add_argument("--token-path", default=_load_env("KIWOOM_TOKEN_PATH", "/oauth2/token"))
     p.add_argument("--candle-path", default=_load_env("KIWOOM_CANDLE_PATH", "/uapi/domestic-stock/v1/quotations/inquire-daily-price"))
-    p.add_argument("--balance-path", default=_load_env("KIWOOM_BALANCE_PATH", "/uapi/domestic-stock/v1/trading/inquire-balance"))
+    p.add_argument("--balance-path", default=_load_env("KIWOOM_BALANCE_PATH", "/api/dostk/acnt"))
     p.add_argument("--order-path", default=_load_env("KIWOOM_ORDER_PATH", "/uapi/domestic-stock/v1/trading/order-cash"))
     p.add_argument("--tr-id-quote", default=_load_env("KIWOOM_TR_ID_QUOTE", "FHKST01010400"))
-    p.add_argument("--tr-id-balance", default=_load_env("KIWOOM_TR_ID_BALANCE", "TTTC8434R"))
+    p.add_argument("--tr-id-balance", default=_load_env("KIWOOM_TR_ID_BALANCE", "ka01690"))
     p.add_argument("--tr-id-buy", default=_load_env("KIWOOM_TR_ID_BUY", "TTTC0802U"))
     p.add_argument("--tr-id-sell", default=_load_env("KIWOOM_TR_ID_SELL", "TTTC0801U"))
     p.add_argument("--app-key", default=_load_env("KIWOOM_APP_KEY"), required=False)
