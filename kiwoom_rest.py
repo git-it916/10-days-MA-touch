@@ -40,9 +40,9 @@ class KiwoomREST:
         """일봉 조회 (ka10005)"""
         return self.client.fetch_daily_candles(code, to_date=to_date, count=count, period="D")
 
-    def get_balance(self, qry_dt: Optional[str] = None) -> Dict[str, Any]:
-        """잔고 조회 (ka01690 일별잔고수익률)"""
-        return self.client.fetch_balance(qry_dt=qry_dt)
+    def get_balance(self, qry_tp: str = "0", dmst_stex_tp: str = "KRX") -> Dict[str, Any]:
+        """잔고 조회 (kt00004 계좌평가현황요청)"""
+        return self.client.fetch_balance(qry_tp=qry_tp, dmst_stex_tp=dmst_stex_tp)
 
     def buy_market(self, code: str, qty: int) -> Dict[str, Any]:
         """시장가 매수"""

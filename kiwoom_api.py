@@ -57,11 +57,11 @@ class KiwoomRestClient:
         token_path: str = "/oauth2/token",
         # 키움 REST 기본값(일봉: ka10005)
         candle_path: str = "/api/dostk/mrkcond",
-        # 잔고(일별잔고수익률 등) 기본값을 키움 REST 규격으로 변경
+        # 잔고 조회 기본값: 계좌평가현황요청(kt00004) 경로/ID
         balance_path: str = "/api/dostk/acnt",
         order_path: str = "/uapi/domestic-stock/v1/trading/order-cash",
         tr_id_quote: str = "ka10005",
-        tr_id_balance: str = "ka01690",
+        tr_id_balance: str = "kt00004",
         tr_id_buy: str = "TTTC0802U",
         tr_id_sell: str = "TTTC0801U",
         timeout: float = 10.0,
@@ -163,13 +163,14 @@ class KiwoomRestClient:
                 continue
         return candles
 
-    # 잔고 조회 (키움 REST 예: ka01690 일별잔고수익률)
-    def fetch_balance(self, qry_dt: Optional[str] = None) -> Dict[str, Any]:
+    # 잔고 조회 (키움 REST: kt00004 계좌평가현황요청)
+    def fetch_balance(self, qry_tp: str = "0", dmst_stex_tp: str = "KRX") -> Dict[str, Any]:
         url = self._url(self.balance_path)
         headers = self._auth_headers(self.tr_id_balance)
-        body: Dict[str, Any] = {}
-        if qry_dt:
-            body["qry_dt"] = qry_dt
+        body: Dict[str, Any] = {
+            "qry_tp": qry_tp,          # 0:전체, 1:상장폐지제외 등 (문서 기준)
+            "dmst_stex_tp": dmst_stex_tp,  # KRX/NXT/SOR
+        }
         resp = self.session.post(url, json=body, headers=headers, timeout=self.timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"Balance request failed: {resp.status_code} {resp.text}")

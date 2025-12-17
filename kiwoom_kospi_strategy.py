@@ -37,6 +37,14 @@ def _pick_first(mapping: Dict[str, Any], keys: List[str], default: Any = None) -
     return default
 
 
+def _to_float(val: Any) -> float:
+    try:
+        s = str(val).replace(",", "").replace("+", "")
+        return float(s)
+    except Exception:
+        return 0.0
+
+
 class KiwoomREST:
     def __init__(
         self,
@@ -89,24 +97,33 @@ class KiwoomREST:
     def fetch_intraday_1m(self, code: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
         """
         ka10080 분봉 차트 조회 (1분봉)
-        Body:
-          stk_cd: 종목코드
-          qry_tp: "1" (1분봉)
-          inqr_strt_dt / inqr_end_dt: YYYYMMDD
+        - URL: /api/dostk/chart
+        - 필수 Body: stk_cd, tic_scope("1"), upd_stkpc_tp("1")
         """
-        url = f"{self.base_url}/api/dostk/mrkcond"
+        url = f"{self.base_url}/api/dostk/chart"
         headers = self._auth_headers("ka10080")
         body = {
             "stk_cd": code,
-            "qry_tp": "1",  # 1분봉
-            "inqr_strt_dt": start_date,
-            "inqr_end_dt": end_date,
+            "tic_scope": "1",      # 1분봉
+            "upd_stkpc_tp": "1",   # 수정주가 반영
         }
         resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
+        # 429 처리: 짧게 대기 후 1회 재시도
+        if resp.status_code == 429:
+            logging.warning("ka10080 429 발생, 2초 대기 후 재시도")
+            import time
+
+            time.sleep(2)
+            resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"Intraday request failed: {resp.status_code} {resp.text}")
         data = resp.json()
-        items = data.get("rec") or data.get("stk_ddwkmm") or data.get("output") or []
+        items = (
+            data.get("stk_min_pole_chart_qry")
+            or data.get("stk_min_pole_chart_qty")
+            or data.get("rec")
+            or []
+        )
         if not items:
             logging.error(
                 "[ka10080] 분봉 응답에 데이터가 없습니다. keys=%s body_sample=%s",
@@ -118,10 +135,11 @@ class KiwoomREST:
     # ------------------------------------------------------------- Balance (ka01690)
     def fetch_balance(self, qry_dt: Optional[str] = None) -> Dict[str, Any]:
         url = f"{self.base_url}/api/dostk/acnt"
-        headers = self._auth_headers("ka01690")
-        body: Dict[str, Any] = {}
-        if qry_dt:
-            body["qry_dt"] = qry_dt
+        headers = self._auth_headers("kt00004")
+        body: Dict[str, Any] = {
+            "qry_tp": "0",        # 전체
+            "dmst_stex_tp": "KRX",
+        }
         resp = self.session.post(url, headers=headers, json=body, timeout=self.timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"Balance request failed: {resp.status_code} {resp.text}")
@@ -130,9 +148,17 @@ class KiwoomREST:
     def extract_cash(self, balance_resp: Dict[str, Any]) -> float:
         """
         응답에서 사용 가능 현금을 추출. 문서 필드명에 따라 조정 필요.
-        시도 키: cash, dpst_amt, dps, dnca_tot_amt, evlu_amt
+        시도 키: ord_alowa, ord_alow_amt, 100ord_alow_amt, entr, tot_est_amt, d2_entra, prsm_dpst_aset_amt
         """
-        candidates = ["cash", "dpst_amt", "dps", "dnca_tot_amt", "evlu_amt"]
+        candidates = [
+            "ord_alowa",
+            "ord_alow_amt",
+            "100ord_alow_amt",
+            "entr",
+            "tot_est_amt",
+            "d2_entra",
+            "prsm_dpst_aset_amt",
+        ]
         val = _pick_first(balance_resp, candidates)
         try:
             return float(str(val).replace(",", ""))
@@ -165,13 +191,14 @@ def run_strategy(client: KiwoomREST) -> None:
     def _parse_time(item: Dict[str, Any]) -> str:
         """
         응답 내 시간 필드를 HHMM으로 정규화.
-        가능한 키: trd_tm, trd_time, time, hhmm, hhmmss, stk_tm, stck_bsop_time 등.
-        숫자만 추출 후 앞 4자리 사용 (예: 090000 -> 0900).
+        가능한 키: cntr_tm(YYYYMMDDHHMMSS), trd_tm, trd_time, time, hhmm, hhmmss 등.
+        숫자만 추출 후 앞 12자리에서 HHMM을 추출 (예: 20250307132000 -> 1320, 090000 -> 0900).
         """
         raw = str(
             _pick_first(
                 item,
                 [
+                    "cntr_tm",
                     "trd_tm",
                     "trd_time",
                     "time",
@@ -183,13 +210,15 @@ def run_strategy(client: KiwoomREST) -> None:
                 default="",
             )
         )
-        digits = re.sub(r"\\D", "", raw)
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) >= 12:
+            return digits[8:12]  # YYYYMMDDHHMMSS -> HHMM
         if len(digits) >= 4:
             return digits[:4]
         return digits.zfill(4)
 
     def _parse_price(item: Dict[str, Any]) -> float:
-        return float(_pick_first(item, ["clpr", "close_pric", "stck_prpr", "prpr"], 0) or 0)
+        return _to_float(_pick_first(item, ["cur_prc", "clpr", "close_pric", "stck_prpr", "prpr"], 0))
 
     # 필터 09:00, 09:20 데이터 찾기
     price_09 = None
