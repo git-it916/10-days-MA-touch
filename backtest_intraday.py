@@ -50,7 +50,7 @@ def fetch_kospi_min_1m_from_api(
     - 가격 필드는 100배 정수로 오므로 100으로 나눔.
     """
     session = session or requests.Session()
-    if (args.app_key and args.secret_key) and not token:
+    if not token:
         token_url = f"{base_url.rstrip('/')}/oauth2/token"
         payload = {"grant_type": "client_credentials", "appkey": app_key, "secretkey": secret_key}
         resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
@@ -70,7 +70,7 @@ def fetch_kospi_min_1m_from_api(
     }
     body = {"inds_cd": inds_cd, "tic_scope": "1"}  # 1분봉
     resp = session.post(url, headers=headers, json=body, timeout=10)
-    if (args.app_key and args.secret_key) and resp.status_code >= 400:
+    if resp.status_code >= 400:
         raise SystemExit(f"업종분봉 조회 실패: {resp.status_code} {resp.text}")
     data = resp.json()
     items = (
@@ -127,7 +127,7 @@ def fetch_foreign_net_prev_day(
     전일 외국인 순매수 금액 (업종별투자자순매수요청 ka10051)
     """
     session = session or requests.Session()
-    if (args.app_key and args.secret_key) and not token:
+    if not token:
         token_url = f"{base_url.rstrip('/')}/oauth2/token"
         payload = {"grant_type": "client_credentials", "appkey": app_key, "secretkey": secret_key}
         resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
@@ -510,7 +510,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--foreign-filter",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="전일 외국인 순매수 > 0 조건 적용 여부",
     )
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="429 발생 시 재시도 전 대기(초)")
@@ -526,7 +526,16 @@ if __name__ == "__main__":
         help="콤마로 구분한 시각 목록만 유지 (기본: 09:00~09:05,10:00)",
     )
     parser.add_argument("--heatmap", action="store_true", help="히트맵 PNG 저장")
+    parser.add_argument(
+        "--foreign-lookback-days",
+        type=int,
+        default=7,
+        help="전일 데이터가 없을 때(주말/휴일) 몇 일 전까지 거슬러 조회할지",
+    )
     args = parser.parse_args()
+
+    if args.foreign_filter is None:
+        args.foreign_filter = ("mockapi.kiwoom.com" not in (args.base_url or ""))
 
     n_values = range(args.n_start, args.n_end + 1, args.n_step)
     m_values = range(args.m_start, args.m_end + 1, args.m_step)
@@ -571,21 +580,25 @@ if __name__ == "__main__":
     if args.foreign_filter:
         foreign_net_map = {}
         for d in sorted(data["date"].unique()):
-            prev_day = (pd.to_datetime(d) - pd.Timedelta(days=1)).strftime("%Y%m%d")
-            val = fetch_foreign_net_prev_day(
-                app_key=args.app_key,
-                secret_key=args.secret_key,
-                base_dt=prev_day,
-                base_url=args.base_url,
-                mkt_tp="0",
-                amt_qty_tp="0",
-                stex_tp="3",
-                inds_cd=args.inds_cd,
-                session=session,
-                token=token,
-                max_retries=args.retry_max,
-                retry_sleep=args.retry_sleep,
-            )
+            val = None
+            for offset in range(1, max(1, args.foreign_lookback_days) + 1):
+                base_dt = (pd.to_datetime(d) - pd.Timedelta(days=offset)).strftime("%Y%m%d")
+                val = fetch_foreign_net_prev_day(
+                    app_key=args.app_key,
+                    secret_key=args.secret_key,
+                    base_dt=base_dt,
+                    base_url=args.base_url,
+                    mkt_tp="0",
+                    amt_qty_tp="0",
+                    stex_tp="3",
+                    inds_cd=args.inds_cd,
+                    session=session,
+                    token=token,
+                    max_retries=args.retry_max,
+                    retry_sleep=args.retry_sleep,
+                )
+                if val is not None:
+                    break
             foreign_net_map[d] = val
 
     grid = run_grid_search_v2(
