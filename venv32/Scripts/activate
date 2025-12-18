@@ -35,7 +35,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="C:\Users\shins\OneDrive\10-days-MA-touch\venv32"
+VIRTUAL_ENV="C:\Users\10845\OneDrive - 이지스자산운용\문서\quant_project\10-days-MA-touch-1\venv32"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

@@ -50,7 +50,7 @@ def fetch_kospi_min_1m_from_api(
     - 가격 필드는 100배 정수로 오므로 100으로 나눔.
     """
     session = session or requests.Session()
-    if not token:
+    if (args.app_key and args.secret_key) and not token:
         token_url = f"{base_url.rstrip('/')}/oauth2/token"
         payload = {"grant_type": "client_credentials", "appkey": app_key, "secretkey": secret_key}
         resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
@@ -70,7 +70,7 @@ def fetch_kospi_min_1m_from_api(
     }
     body = {"inds_cd": inds_cd, "tic_scope": "1"}  # 1분봉
     resp = session.post(url, headers=headers, json=body, timeout=10)
-    if resp.status_code >= 400:
+    if (args.app_key and args.secret_key) and resp.status_code >= 400:
         raise SystemExit(f"업종분봉 조회 실패: {resp.status_code} {resp.text}")
     data = resp.json()
     items = (
@@ -127,7 +127,7 @@ def fetch_foreign_net_prev_day(
     전일 외국인 순매수 금액 (업종별투자자순매수요청 ka10051)
     """
     session = session or requests.Session()
-    if not token:
+    if (args.app_key and args.secret_key) and not token:
         token_url = f"{base_url.rstrip('/')}/oauth2/token"
         payload = {"grant_type": "client_credentials", "appkey": app_key, "secretkey": secret_key}
         resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
@@ -179,8 +179,8 @@ def load_intraday_1m(
     token: Optional[str] = None,
     start_date: Optional[str] = None,  # YYYYMMDD or YYYY-MM-DD
     end_date: Optional[str] = None,
-    time_start: str = "09:00",
-    time_end: str = "10:00",
+    time_start: str = "",
+    time_end: str = "",
     force_refresh: bool = False,
     keep_times: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
@@ -212,10 +212,11 @@ def load_intraday_1m(
         # 필요한 시간(09:00, 10:00) 중 하나라도 없으면 다시 fetch
         sample_dates = df["date"].unique()
         missing_time = False
-        for t in (time_start, time_end):
-            if df.loc[df["time"] == t].empty:
-                missing_time = True
-                break
+        if time_start and time_end:
+            for t in (time_start, time_end):
+                if df.loc[df["time"] == t].empty:
+                    missing_time = True
+                    break
         if missing_time:
             print(f"로컬 CSV에 필요한 시간대({time_start}~{time_end}) 데이터가 없어 API 재수집을 시도합니다.")
             need_fetch = True
@@ -260,8 +261,12 @@ def load_intraday_1m(
         df = df[pd.to_datetime(df["date"]) <= end_dt]
 
     # 시간 필터링(필요 구간만)
-    if time_start or time_end:
+    if time_start and time_end:
         df = df[(df["time"] >= time_start) & (df["time"] <= time_end)]
+    elif time_start:
+        df = df[df["time"] >= time_start]
+    elif time_end:
+        df = df[df["time"] <= time_end]
 
     # 특정 시각만 유지 (예: 09:00~09:05, 10:00)
     if keep_times:
@@ -275,11 +280,20 @@ def _time_str(base: Tuple[int, int], minutes: int) -> str:
     t = (dt.datetime(2000, 1, 1, h, m) + dt.timedelta(minutes=minutes)).time()
     return f"{t:%H:%M}"
 
+def _add_minutes(hhmm: str, minutes: int) -> str:
+    hhmm = hhmm.strip()
+    try:
+        h, m = hhmm.split(":")
+        base_dt = dt.datetime(2000, 1, 1, int(h), int(m))
+    except Exception:
+        raise SystemExit(f"잘못된 시각 형식입니다: {hhmm!r} (예: 09:00)")
+    return (base_dt + dt.timedelta(minutes=minutes)).strftime("%H:%M")
+
 def _pick_price(day: pd.DataFrame, target: str) -> Optional[float]:
     exact = day.loc[day["time"] == target, "close"]
     if not exact.empty:
         return float(exact.iloc[0])
-    before = day.loc[day["time"] < target]
+    before = day.loc[day["time"] < target, "close"]
     if not before.empty:
         return float(before.iloc[-1])
     return None
@@ -362,6 +376,100 @@ def run_grid_search(
         return pd.DataFrame(columns=["n", "m", "trades", "cum_return", "sharpe", "mdd"])
     return pd.DataFrame(results).sort_values(["m", "n"]).reset_index(drop=True)
 
+def simulate_day_v2(
+    day: pd.DataFrame,
+    foreign_net: Optional[float],
+    cost: float,
+    base_time: str,
+    n: int,
+    m: int,
+    *,
+    auto_base_time: bool = True,
+    foreign_filter: bool = True,
+) -> Optional[float]:
+    if foreign_filter and (foreign_net is None or foreign_net <= 0):
+        return None
+    if day.empty:
+        return None
+
+    base_time_used = base_time
+    if auto_base_time and day.loc[day["time"] <= base_time].empty:
+        base_time_used = str(day.iloc[0]["time"])
+
+    entry_time = _add_minutes(base_time_used, n)
+    exit_time = _add_minutes(base_time_used, m)
+
+    day_upto_exit = day[day["time"] <= exit_time]
+    if day_upto_exit.empty:
+        return None
+
+    open_base = _pick_price(day_upto_exit, base_time_used)
+    ref_close = _pick_price(day_upto_exit, entry_time)
+    exit_px = _pick_price(day_upto_exit, exit_time)
+    if open_base is None or ref_close is None or exit_px is None:
+        return None
+
+    direction = 1 if ref_close > open_base else -1
+    gross_ret = direction * (exit_px - open_base) / open_base
+    return gross_ret - cost
+
+def run_grid_search_v2(
+    df: pd.DataFrame,
+    n_values: Iterable[int],
+    m_values: Iterable[int],
+    *,
+    cost: float = COST_ROUNDTRIP,
+    foreign_net_map: Optional[Dict[Any, float]] = None,
+    base_time: str = "09:00",
+    auto_base_time: bool = True,
+    foreign_filter: bool = True,
+) -> pd.DataFrame:
+    results = []
+    by_date = df.groupby("date")
+
+    for n, m in itertools.product(n_values, m_values):
+        daily_rets = []
+        for _, day in by_date:
+            foreign_net = None
+            if foreign_net_map is not None:
+                foreign_net = foreign_net_map.get(day["date"].iloc[0])
+            r = simulate_day_v2(
+                day,
+                foreign_net=foreign_net,
+                cost=cost,
+                base_time=base_time,
+                n=n,
+                m=m,
+                auto_base_time=auto_base_time,
+                foreign_filter=foreign_filter,
+            )
+            if r is not None:
+                daily_rets.append(r)
+        if not daily_rets:
+            continue
+
+        rets = pd.Series(daily_rets)
+        cum_return = float((1 + rets).prod() - 1)
+        vol = rets.std(ddof=1)
+        sharpe = float((rets.mean() / vol) * np.sqrt(252)) if vol > 0 else 0.0
+        curve = (1 + rets).cumprod()
+        dd = (curve / curve.cummax()) - 1
+        mdd = float(dd.min())
+        results.append(
+            {
+                "n": n,
+                "m": m,
+                "trades": len(rets),
+                "cum_return": cum_return,
+                "sharpe": sharpe,
+                "mdd": mdd,
+            }
+        )
+
+    if not results:
+        return pd.DataFrame(columns=["n", "m", "trades", "cum_return", "sharpe", "mdd"])
+    return pd.DataFrame(results).sort_values(["m", "n"]).reset_index(drop=True)
+
 def plot_heatmap(df: pd.DataFrame, out_path: str = "grid_heatmap.png") -> None:
     try:
         import seaborn as sns
@@ -392,16 +500,29 @@ if __name__ == "__main__":
     parser.add_argument("--m-start", type=int, default=60, help="청산 시점(분) 기본 60 -> 10:00")
     parser.add_argument("--m-end", type=int, default=60)
     parser.add_argument("--m-step", type=int, default=1)
+    parser.add_argument("--base-time", default="09:00", help="기준 시각(HH:MM). n/m은 이 시각 기준 분 오프셋")
+    parser.add_argument(
+        "--auto-base-time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="데이터에 base-time 이전 구간이 없으면(예: 장중 일부만 수집) 첫 캔들을 기준 시각으로 자동 보정",
+    )
+    parser.add_argument(
+        "--foreign-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="전일 외국인 순매수 > 0 조건 적용 여부",
+    )
     parser.add_argument("--retry-sleep", type=float, default=2.0, help="429 발생 시 재시도 전 대기(초)")
     parser.add_argument("--retry-max", type=int, default=3, help="429 재시도 횟수")
     parser.add_argument("--start-date", default=None, help="YYYYMMDD, 미지정 시 데이터 연도 12월 1일부터 필터")
     parser.add_argument("--end-date", default=None, help="YYYYMMDD, 미지정 시 데이터 연도 12월 31일까지 필터")
-    parser.add_argument("--time-start", default="09:00", help="시작 시간 필터 (기본 09:00)")
-    parser.add_argument("--time-end", default="10:00", help="종료 시간 필터 (기본 10:00)")
+    parser.add_argument("--time-start", default="", help="시작 시간 필터 (예: 09:00). 비우면 적용 안 함")
+    parser.add_argument("--time-end", default="", help="종료 시간 필터 (예: 10:00). 비우면 적용 안 함")
     parser.add_argument("--force-refresh", action="store_true", help="로컬 CSV 무시하고 API 강제 수집")
     parser.add_argument(
         "--keep-times",
-        default="09:00,09:01,09:02,09:03,09:04,09:05,10:00",
+        default="",
         help="콤마로 구분한 시각 목록만 유지 (기본: 09:00~09:05,10:00)",
     )
     parser.add_argument("--heatmap", action="store_true", help="히트맵 PNG 저장")
@@ -410,21 +531,22 @@ if __name__ == "__main__":
     n_values = range(args.n_start, args.n_end + 1, args.n_step)
     m_values = range(args.m_start, args.m_end + 1, args.m_step)
 
-    if not args.app_key or not args.secret_key:
+    if args.foreign_filter and (not args.app_key or not args.secret_key):
         raise SystemExit("이 전략은 외국인 순매수 조건을 쓰므로 --app-key, --secret-key가 필요합니다.")
 
     # 세션/토큰을 한 번만 발급해 재사용 (429 완화)
     session = requests.Session()
+    token = None
     token_url = f"{args.base_url.rstrip('/')}/oauth2/token"
-    payload = {"grant_type": "client_credentials", "appkey": args.app_key, "secretkey": args.secret_key}
+    payload = {"grant_type": "client_credentials", "appkey": args.app_key or "", "secretkey": args.secret_key or ""}
     resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
     if resp.status_code == 429:
         time.sleep(2)
         resp = session.post(token_url, json=payload, headers={"Content-Type": "application/json;charset=UTF-8"}, timeout=10)
-    if resp.status_code >= 400:
+    if (args.app_key and args.secret_key) and resp.status_code >= 400:
         raise SystemExit(f"토큰 발급 실패: {resp.status_code} {resp.text}")
-    token = resp.json().get("access_token") or resp.json().get("token")
-    if not token:
+    token = (resp.json().get("access_token") or resp.json().get("token")) if (args.app_key and args.secret_key) else None
+    if (args.app_key and args.secret_key) and not token:
         raise SystemExit(f"토큰이 응답에 없습니다: {resp.text[:200]}")
 
     data = load_intraday_1m(
@@ -445,30 +567,35 @@ if __name__ == "__main__":
     )
 
     # 전일 외국인 순매수 지도 생성
-    foreign_net_map: Dict[Any, float] = {}
-    for d in sorted(data["date"].unique()):
-        prev_day = (pd.to_datetime(d) - pd.Timedelta(days=1)).strftime("%Y%m%d")
-        val = fetch_foreign_net_prev_day(
-            app_key=args.app_key,
-            secret_key=args.secret_key,
-            base_dt=prev_day,
-            base_url=args.base_url,
-            mkt_tp="0",
-            amt_qty_tp="0",
-            stex_tp="3",
-            inds_cd=args.inds_cd,
-            session=session,
-            token=token,
-            max_retries=args.retry_max,
-            retry_sleep=args.retry_sleep,
-        )
-        foreign_net_map[d] = val
+    foreign_net_map: Optional[Dict[Any, float]] = None
+    if args.foreign_filter:
+        foreign_net_map = {}
+        for d in sorted(data["date"].unique()):
+            prev_day = (pd.to_datetime(d) - pd.Timedelta(days=1)).strftime("%Y%m%d")
+            val = fetch_foreign_net_prev_day(
+                app_key=args.app_key,
+                secret_key=args.secret_key,
+                base_dt=prev_day,
+                base_url=args.base_url,
+                mkt_tp="0",
+                amt_qty_tp="0",
+                stex_tp="3",
+                inds_cd=args.inds_cd,
+                session=session,
+                token=token,
+                max_retries=args.retry_max,
+                retry_sleep=args.retry_sleep,
+            )
+            foreign_net_map[d] = val
 
-    grid = run_grid_search(
+    grid = run_grid_search_v2(
         data,
         n_values=n_values,
         m_values=m_values,
         foreign_net_map=foreign_net_map,
+        base_time=args.base_time,
+        auto_base_time=args.auto_base_time,
+        foreign_filter=args.foreign_filter,
     )
     print(grid)
     if args.heatmap:

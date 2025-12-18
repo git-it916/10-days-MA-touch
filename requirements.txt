@@ -3,5 +3,7 @@ pywin32>=306
 # 32비트 환경 호환성을 위해 pandas는 2.0 계열, numpy는 1.x로 고정
 pandas==2.0.3
 numpy>=1.26,<2
+matplotlib==3.7.3
+seaborn>=0.13.0
 requests>=2.31.0
 yfinance==0.2.37
