@@ -3,9 +3,9 @@
 [KOSPI 전략] 전일 수급 + 09:02 모멘텀 + 10:00 청산
 
 전략 요약
-- (필터) 전일 외국인 순매수(+)일 때만 진입 (기본 동작)
-- (진입) 09:00 대비 09:02 수익률이 양(+)이면 KODEX 200(069500) 매수
-         음(-)이면 KODEX 인버스(114800) 매수
+- (필터/진입) 전일 외국인 순매수(+) & 09:00~09:02 수익률(+)이면 KODEX 200(069500) 매수
+- (필터/진입) 전일 외국인 순매수(-) & 09:00~09:02 수익률(-)이면 KODEX 인버스(114800) 매수
+- (기타) 위 조건 불일치 시 진입하지 않음
 - (청산) 10:00 전량 매도
 
 주의/가정
@@ -27,6 +27,9 @@ import time
 from typing import Dict, List, Optional, Any
 
 import requests
+
+
+FIXED_INVEST_KRW = 3_000_000  # 300만원
 
 
 def configure_logging() -> None:
@@ -483,13 +486,16 @@ def run(client: KiwoomREST, test_mode: bool = False) -> None:
         logging.error("데이터 조회 실패로 종료합니다.")
         return
 
-    if foreigner_net <= 0 and not test_mode:
-        logging.info("!! 전일 수급 음수(-) -> 전략 조건 불만족. 종료합니다.")
+    foreigner_dir = 1 if foreigner_net > 0 else -1 if foreigner_net < 0 else 0
+    if foreigner_dir == 0 and not test_mode:
+        logging.info("!! 전일 수급 0 -> 전략 조건 불만족. 종료합니다.")
         return
-    if foreigner_net <= 0 and test_mode:
-        logging.info("!! (테스트 모드) 수급 음수지만 강제로 진행합니다.")
+    if foreigner_dir == 0 and test_mode:
+        logging.info("!! (테스트 모드) 전일 수급 0이지만 강제로 진행합니다.")
+    elif foreigner_dir > 0:
+        logging.info("!! 전일 수급 양수(+) -> 롱 조건만 허용")
     else:
-        logging.info("!! 전일 수급 양수(+) -> 진행 승인")
+        logging.info("!! 전일 수급 음수(-) -> 숏 조건만 허용")
 
     # 2. 09:02 대기
     if not test_mode:
@@ -514,9 +520,27 @@ def run(client: KiwoomREST, test_mode: bool = False) -> None:
     ret = (p_0902 - p_0900) / p_0900 if p_0900 else 0.0
     logging.info(" -> 09:00: %.2f, 09:02: %.2f (수익률: %.4f)", p_0900, p_0902, ret)
 
+    if ret > 0:
+        ret_dir = 1
+    elif ret < 0:
+        ret_dir = -1
+    else:
+        logging.info(" -> 09:00~09:02 수익률 0. 방향 없음으로 종료합니다.")
+        return
+
+    if not test_mode and foreigner_dir != ret_dir:
+        logging.info(
+            "!! 수급 방향(%s)과 09:00~09:02 방향(%s) 불일치 -> 진입하지 않습니다.",
+            "양수(+)" if foreigner_dir > 0 else "음수(-)",
+            "상승(+)" if ret_dir > 0 else "하락(-)",
+        )
+        return
+    if test_mode and foreigner_dir not in (0, ret_dir):
+        logging.info("!! (테스트 모드) 수급/모멘텀 불일치지만 강제로 진행합니다.")
+
     # 09:02 모멘텀 기준으로 진입 종목 결정
-    target_code = "069500" if ret > 0 else "114800"  # 200 vs 인버스
-    logging.info(" -> 진입 종목: %s (%s)", target_code, ("매수(Long)" if ret > 0 else "매수(Short/Inverse)"))
+    target_code = "069500" if ret_dir > 0 else "114800"  # 200 vs 인버스
+    logging.info(" -> 진입 종목: %s (%s)", target_code, ("매수(Long)" if ret_dir > 0 else "매수(Short/Inverse)"))
 
     # 4. 매수(예수금 기반)
     logging.info("3. 예수금/현재가 조회 후 주문...")
@@ -528,8 +552,12 @@ def run(client: KiwoomREST, test_mode: bool = False) -> None:
         logging.error(" -> 예수금 0원으로 주문 불가")
         return
 
-    invest = int(cash * 0.98)
-    logging.info(" -> 투입 비중: 98%% (투입금=%s원)", f"{invest:,}")
+    invest = FIXED_INVEST_KRW
+    if cash < invest:
+        logging.error(" -> 예수금 부족으로 주문 불가 (예수금=%s원, 필요=%s원)", f"{cash:,}", f"{invest:,}")
+        return
+
+    logging.info(" -> 투입금 고정: %s원", f"{invest:,}")
     curr_price = client.get_current_price(target_code)
     if curr_price <= 0:
         logging.error(" -> 현재가 조회 실패로 주문 불가")
