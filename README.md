@@ -1,112 +1,105 @@
-# Kiwoom KOSPI Strategy (REST, Windows 32bit)
+# KOSPI-SP 베타 Z-Score 전략 (REST 자동매매 예제)
 
-이 레포는 키움 REST API로 **KOSPI 지수 분봉(ka20005)** 과 **전일 외국인 수급(ka10051)** 을 활용해, 아침 모멘텀 기반으로 ETF를 매수하고 10:00에 청산하는 예제를 포함합니다.
+이 레포는 `kospi_sp_beta.py` 하나로 동작하는 **KOSPI 지수 기반 퀀트 전략 예제**입니다.  
+엑셀로 준비한 과거 데이터 + 오늘의 외부 지표(S&P500, VIX, 환율)를 합쳐 Z-Score를 계산하고, 조건이 맞으면 KOSPI ETF를 매수합니다.
 
-이 문서는 `kiwoom_kospi_strategy.py`만 꼼꼼히 설명합니다.
+> 참고: 클래스 이름은 `KiwoomREST`지만, 실제 호출 경로는 `/api/dostk/...` 형태(KIS 스타일)입니다.  
+> 사용하려는 증권사/모의서버에 맞게 `--base-url`과 필요한 헤더/경로를 반드시 확인하세요.
 
 ---
 
-## 1) 준비물
+## 1) 파일 구성
 
-- Windows + 32bit Python 3.x 권장
+- `kospi_sp_beta.py` : 전략 실행 스크립트
+- `requirements.txt` : 실행에 필요한 패키지 목록
+
+---
+
+## 2) 준비물
+
+- Windows + Python 3.x (32bit 권장, `requirements.txt` 참고)
 - 가상환경(예: `venv32`)
   - 생성: `py -3.11-32 -m venv venv32`
   - 활성화: `.\venv32\Scripts\Activate.ps1`
 - 패키지 설치: `python -m pip install -r requirements.txt`
 
-가능하면 실행은 아래처럼 **가상환경 파이썬 경로를 고정**해서 사용하세요.
-- `.\venv32\Scripts\python.exe kiwoom_kospi_strategy.py ...`
-
 ---
 
-## 2) `kiwoom_kospi_strategy.py` 전략 개요
+## 3) 엑셀 데이터 준비
 
-전략 이름: **전일 수급 + 09:02 모멘텀 + 10:00 청산**
+스크립트는 아래 컬럼을 가진 엑셀 파일을 읽습니다.
 
-1. (필터) “전일 외국인 순매수”가 **0보다 큰 날만** 진입
-2. (진입 시그널) KOSPI 지수의 `09:00` 대비 `09:02` 수익률로 방향 결정
-   - 상승(+) → `069500` (KODEX 200) 매수
-   - 하락/0 → `114800` (KODEX 인버스) 매수
-3. (청산) `10:00`에 전량 매도
+- `공통날짜`
+- `kospi_t`
+- `SPX_t-1`
+- `VIX_t-1`
+- `FX_t`
 
-주의:
-- 현재 코드는 흐름을 단순화하기 위해 “매수 수량 = 매도 수량”으로 청산합니다.
-- 실제 운용에서는 잔고조회로 종목별 **실보유수량**을 다시 확인해서 청산하는 방식이 안전합니다(부분체결/미체결 대응).
+엑셀 경로는 코드 상단의 `EXCEL_PATH`에서 지정합니다.
 
----
-
-## 3) 사용 API (요약)
-
-`kiwoom_kospi_strategy.py`는 아래를 호출합니다(환경/문서 버전에 따라 응답 키는 달라질 수 있음).
-
-- `POST /oauth2/token` : 토큰 발급
-- `ka10051` (`/api/dostk/sect`) : 전일 외국인 순매수(금액)
-- `ka20005` (`/api/dostk/chart`) : KOSPI 지수 1분봉
-- `kt00004` (`/api/dostk/acnt`) : 예수금(주문가능금액)
-- `ka10001` (`/api/dostk/mrkcond`) : 현재가 조회(주문 수량 계산용)
-- `kt10000` / `kt10001` (`/api/dostk/ordr`) : 시장가 매수/매도
+```python
+EXCEL_PATH = r"C:\Users\...\kospi_sp500_filtered_longterm.xlsx"
+```
 
 ---
 
 ## 4) 실행 방법
 
-### (A) 모의투자(mockapi)
-
 ```powershell
-.\venv32\Scripts\python.exe kiwoom_kospi_strategy.py `
+.\venv32\Scripts\python.exe kospi_sp_beta.py `
   --app-key "APP_KEY" `
   --secret-key "SECRET_KEY" `
-  --account "8116773911" `
-  --base-url "https://mockapi.kiwoom.com"
+  --account "1234567890" `
 ```
 
-### (B) 실서버(운영)
-
-```powershell
-.\venv32\Scripts\python.exe kiwoom_kospi_strategy.py `
-  --app-key "APP_KEY" `
-  --secret-key "SECRET_KEY" `
-  --account "8116773911" `
-  --base-url "https://api.kiwoom.com"
-```
-
-### (C) 테스트 모드(시간 대기 없이 로직만 실행)
-
-```powershell
-.\venv32\Scripts\python.exe kiwoom_kospi_strategy.py `
-  --app-key "APP_KEY" `
-  --secret-key "SECRET_KEY" `
-  --account "8116773911" `
-  --test
-```
+- 실행 중에 아래 값을 직접 입력해야 합니다.
+  - 어제 S&P500 종가
+  - 어제 VIX 종가
+  - 오늘 원/달러 환율
 
 ---
 
-## 5) 로그(출력) 특징
+## 5) 전략 로직 요약
 
-이 스크립트는 “실행이 진행 중인지”를 확실히 알 수 있게 로그를 촘촘히 찍습니다.
-
-- 모든 로그를 표준출력(`stdout`)으로 출력(터미널에서 항상 보이게)
-- API 호출마다:
-  - 요청 시작/응답 수신(HTTP 코드, 소요시간 ms)
-  - 응답 키 목록 요약
-  - 429(레이트리밋) 재시도 로그
-- 대기(`wait_until`) 중에도 일정 주기로 “대기 중…” 출력
-
-보안 주의:
-- 코드에서는 토큰을 로그에 출력하지 않습니다.
-- 하지만 커맨드라인에 `--app-key/--secret-key`를 직접 넣으면 PowerShell 히스토리에 남을 수 있습니다.
+1. 과거 엑셀 데이터 + 오늘 입력값을 합쳐 수익률/베타/잔차 계산
+2. 60일 롤링 베타로 잔차(residual) 계산 후 Z-Score 산출
+3. 리스크 필터:
+   - VIX 분위수(`VIX_Q`)  
+   - 환율 쇼크 분위수(`FX_Q`)
+4. 신호 결정:
+   - `z <= -ENTRY` → Long
+   - `z >= ENTRY` → Short(인버스)
+   - `|z| <= EXIT` → 중립(청산)
+   - 리스크 필터 위반/손절 기준 → 강제 청산
 
 ---
 
-## 6) 흔한 문제/체크 포인트
+## 6) 주문 흐름(중요)
 
-- 전일 수급이 0 또는 음수로 나와서 종료
-  - 전략의 필터가 정상 동작한 것입니다.
-  - 흐름만 확인하고 싶으면 `--test`로 실행하세요.
-- 분봉에서 09:00/09:02가 안 잡힘
-  - 응답의 시간 키 포맷이 달라 파싱이 실패했을 수 있습니다.
-  - 스크립트 로그의 “HHMM 샘플”로 어떤 시간이 들어오는지 먼저 확인하세요.
-- 주문 API 실패
-  - 실서버는 계좌번호/추가 인증/필수 필드가 더 필요할 수 있습니다. 문서 기준으로 주문 body를 보강해야 합니다.
+- 현재 보유 포지션을 **사용자에게 직접 질문**합니다.
+- 기존 포지션 청산은 **자동화되어 있지 않으며** HTS에서 수동 매도하도록 안내합니다.
+- 신규 진입 시에만 시장가 매수 주문을 전송합니다.
+- 주문 전 `y/n`으로 최종 확인을 받습니다.
 
+---
+
+## 7) 자주 막히는 포인트
+
+- 엑셀 로드 실패 → `openpyxl` 설치 여부 확인
+- KOSPI 지수 조회 실패 → API 권한/경로/헤더 확인 또는 수동 입력
+- 주문 실패 → 계좌번호/추가 인증/필수 필드가 누락되었는지 확인
+
+---
+
+## 8) 설정값(코드 상단에서 조정)
+
+- `EXCEL_PATH` : 엑셀 위치
+- `FIXED_INVEST_KRW` : 1회 진입 금액
+- `ENTRY`, `EXIT`, `VIX_Q`, `FX_Q`, `STOP_LOSS_MULT`
+- `CODE_LONG`, `CODE_SHORT`
+
+---
+
+## 9) 면책
+
+이 코드는 학습/실험용 예제입니다. 실거래에 사용할 경우, API 스펙과 리스크 관리 로직을 충분히 검증하세요.
