@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-[KOSPI 퀀트 전략 자동매매]
-Global Optimized Parameters: Entry 2.0 / Exit 0.0 / VIX 0.85 / FX 0.90
+[KOSPI-S&P500 베타 잔차 평균 회귀 전략 자동매매]
+Optimized Parameters: Entry 2.15 / Exit 0.0 / Stop 7.095 / VIX 0.94 / FX 0.96
 
 실행 시점: 매일 아침 09:00 ~ 09:10 사이 권장
 기능:
 1. 엑셀 데이터 로드 및 사용자 입력(S&P500, VIX, 환율) 받기
 2. 현재 KOSPI 지수 API 조회 후 전략 지표(Z-Score) 계산
 3. 매매 신호(Long/Short/Cash) 발생 시 API로 자동 주문
+4. 백테스트: 성과 지표(Sharpe, MDD, 연환산 수익률) 계산
+
+Look-ahead Bias 방지: 모든 rolling 통계량에 shift(1) 적용
+신호 생성: current_pos 상태 머신으로 구현
 """
 
 import argparse
@@ -31,12 +35,12 @@ FIXED_INVEST_KRW = 3_000_000  # 1회 진입 금액 (300만원)
 CODE_LONG  = "069500"  # KODEX 200
 CODE_SHORT = "114800"  # KODEX 인버스 (또는 252670 200선물인버스2X)
 
-# 전략 파라미터 (Global Best)
-ENTRY = 2.0
+# 전략 파라미터 (Optimized)
+ENTRY = 2.15
 EXIT  = 0.0
-VIX_Q = 0.85
-FX_Q  = 0.90
-STOP_LOSS_MULT = 3.0  # Z-Score 6.0 이상 벌어지면 손절
+VIX_Q = 0.94
+FX_Q  = 0.96
+STOP_LOSS_MULT = 3.3  # Z-Score 7.095 이상 벌어지면 손절 (2.15 x 3.3)
 
 # =========================================================
 # 2. 로깅 및 유틸리티
@@ -141,15 +145,15 @@ class KiwoomREST:
             return 0
 
     def fetch_kospi_index_curr(self) -> float:
-        """KOSPI 현재 지수 조회 (업종현재가)"""
-        body = {"inds_cd": "001"} # 001: KOSPI
+        """KOSPI 200 현재 지수 조회 (업종현재가)"""
+        body = {"inds_cd": "028"} # 028: KOSPI 200 (001: KOSPI)
         try:
             data = self._post_json(path="/api/dostk/inds-mrkcond", api_id="ka20002", body=body) # API ID/Path 확인 필요
             # 값이 '260050' 처럼 오면 2600.50임. 100으로 나눔
             val = _pick_first(data, ["inds_prpr", "cur_prc"], "0")
             return float(val.replace(",","")) / 100.0
         except:
-            logging.warning("지수 조회 실패, 사용자 입력으로 대체 권장")
+            logging.warning("KOSPI 200 지수 조회 실패, 사용자 입력으로 대체 권장")
             return 0.0
 
     def send_order(self, side: str, code: str, qty: int) -> bool:
@@ -216,14 +220,14 @@ def calculate_signal(
     full_df["resid_std"]  = full_df["resid"].rolling(RES_W).std().shift(1)
     full_df["z"] = (full_df["resid"] - full_df["resid_mean"]) / full_df["resid_std"]
 
-    # Filters
+    # Filters (with shift(1) to prevent look-ahead bias)
     W_FILTER = 252
-    full_df["vix_rank"] = full_df["VIX_t-1"].rolling(W_FILTER).rank(pct=True)
-    
+    full_df["vix_rank"] = full_df["VIX_t-1"].rolling(W_FILTER).rank(pct=True).shift(1)
+
     full_df["fx_mean"] = full_df["rFX"].rolling(W_FILTER).mean()
     full_df["fx_std"]  = full_df["rFX"].rolling(W_FILTER).std()
     full_df["fx_z"]    = (full_df["rFX"] - full_df["fx_mean"]) / full_df["fx_std"]
-    full_df["fx_shock"] = full_df["fx_z"].abs().rolling(W_FILTER).rank(pct=True)
+    full_df["fx_shock"] = full_df["fx_z"].abs().rolling(W_FILTER).rank(pct=True).shift(1)
 
     # 마지막 행(오늘) 추출
     today_row = full_df.iloc[-1]
@@ -297,15 +301,15 @@ def run(client: KiwoomREST, args) -> None:
         logging.error("숫자를 정확히 입력해주세요.")
         return
 
-    # 3. API로 KOSPI 조회
-    logging.info("2. KOSPI 현재가 조회 중...")
+    # 3. API로 KOSPI 200 조회
+    logging.info("2. KOSPI 200 현재가 조회 중...")
     kospi_now = client.fetch_kospi_index_curr()
     if kospi_now <= 0:
         # API 조회 실패 시 수동 입력
         logging.warning("API 지수 조회 실패/불가. 수동 입력을 받습니다.")
-        kospi_now = float(input("현재 KOSPI 지수 입력 (예: 2600.50): ").strip())
+        kospi_now = float(input("현재 KOSPI 200 지수 입력 (예: 360.50): ").strip())
 
-    logging.info(" -> KOSPI: %.2f | S&P: %.2f | VIX: %.2f | FX: %.2f", 
+    logging.info(" -> KOSPI 200: %.2f | S&P: %.2f | VIX: %.2f | FX: %.2f", 
                  kospi_now, spx_in, vix_in, fx_in)
 
     # 4. 전략 계산
